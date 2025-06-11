@@ -1,0 +1,145 @@
+#include <opencv2/opencv.hpp>
+#include <cmath>
+#include <limits>
+
+#define SCALE 50.0
+const int WIDTH = 500;
+const int HEIGHT = 500;
+const cv::Point CENTER(WIDTH / 2, HEIGHT / 2);
+
+float pointToAngle(const cv::Point& pt) {
+    float dx = (pt.x - CENTER.x) / SCALE;
+    float dy = (CENTER.y - pt.y) / SCALE;
+    return std::atan2(dy, dx);
+}
+
+float pointToRange(const cv::Point& pt) {
+    float dx = (pt.x - CENTER.x) / SCALE;
+    float dy = (CENTER.y - pt.y) / SCALE;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// 화살표 그리기 함수
+void drawArrow(cv::Mat& img, float angle, cv::Scalar color, int thickness = 2) {
+    float x = 0.8f * std::cos(angle);
+    float y = 0.8f * std::sin(angle);
+    cv::Point target(
+        static_cast<int>(CENTER.x + x * SCALE),
+        static_cast<int>(CENTER.y - y * SCALE)
+    );
+    cv::arrowedLine(img, CENTER, target, color, thickness);
+}
+
+// 화살표가 추적하는 장애물 위치 주변 점들만 모아서 바운딩 박스 계산
+cv::Rect getBoundingBoxForTrackedObstacle(
+    const std::vector<cv::Point>& points, float angle, float range,
+    float angle_tol = 0.1f, float range_tol = 0.1f) 
+{
+    std::vector<cv::Point> matched_points;
+
+    for (const auto& pt : points) {
+        float pt_range = pointToRange(pt);
+        float pt_angle = pointToAngle(pt);
+
+        if (std::abs(pt_angle - angle) < angle_tol && std::abs(pt_range - range) < range_tol) {
+            matched_points.push_back(pt);
+        }
+    }
+
+    if (matched_points.empty()) {
+        return cv::Rect();  // 빈 박스 반환
+    } else {
+        return cv::boundingRect(matched_points);
+    }
+}
+
+int main() {
+    cv::VideoCapture cap("lidar.mp4");
+    if (!cap.isOpened()) {
+        std::cerr << "Failed to open video.\n";
+        return -1;
+    }
+
+    cv::namedWindow("Simulated LIDAR", cv::WINDOW_NORMAL);
+
+    while (true) {
+        cv::Mat frame;
+        if (!cap.read(frame)) break;
+
+        // 1. 빨간 점 마스크 추출
+        cv::Mat red_mask;
+        cv::inRange(frame, cv::Scalar(0, 0, 150), cv::Scalar(80, 80, 255), red_mask);
+
+        // 3. 빨간 점 수집
+        std::vector<cv::Point> lidar_points;
+        for (int y = 0; y < frame.rows; ++y) {
+            for (int x = 0; x < frame.cols; ++x) {
+                cv::Vec3b color = frame.at<cv::Vec3b>(y, x);
+                if (color[2] > 200 && color[1] < 80 && color[0] < 80) {
+                    lidar_points.push_back(cv::Point(x, y));
+                }
+            }
+        }
+
+        // 4. 좌/우 최단 거리 장애물 탐지 초기화
+        float min_left_range = std::numeric_limits<float>::max();
+        float min_right_range = std::numeric_limits<float>::max();
+        float min_left_angle = -M_PI;
+        float min_right_angle = M_PI;
+
+        // 5. 좌/우 장애물 최단거리 및 각도 구하기
+        for (const auto& pt : lidar_points) {
+            float range = pointToRange(pt);
+            if (range > 1.0) continue;
+
+            float angle = pointToAngle(pt);
+            if (angle < -M_PI_2 || angle > M_PI_2) continue;
+
+            if (angle < 0 && range < min_left_range) {
+                min_left_range = range;
+                min_left_angle = angle;
+            } else if (angle >= 0 && range < min_right_range) {
+                min_right_range = range;
+                min_right_angle = angle;
+            }
+        }
+
+        // 6. 화살표가 추적하는 장애물만 바운딩 박스 표시
+        if (min_left_range < std::numeric_limits<float>::max()) {
+            cv::Rect left_bbox = getBoundingBoxForTrackedObstacle(lidar_points, min_left_angle, min_left_range);
+            if (left_bbox.area() > 0)
+                cv::rectangle(frame, left_bbox, cv::Scalar(0, 255, 255), 2);
+        }
+
+        if (min_right_range < std::numeric_limits<float>::max()) {
+            cv::Rect right_bbox = getBoundingBoxForTrackedObstacle(lidar_points, min_right_angle, min_right_range);
+            if (right_bbox.area() > 0)
+                cv::rectangle(frame, right_bbox, cv::Scalar(0, 255, 255), 2);
+        }
+
+        // 7. 좌/우 화살표 출력
+        drawArrow(frame,
+                  min_left_angle,
+                  min_left_range < std::numeric_limits<float>::max() ? cv::Scalar(0, 0, 255) : cv::Scalar(200, 200, 200),
+                  2);
+
+        drawArrow(frame,
+                  min_right_angle,
+                  min_right_range < std::numeric_limits<float>::max() ? cv::Scalar(0, 0, 255) : cv::Scalar(200, 200, 200),
+                  2);
+
+        // 8. 중심 및 전방 표시
+        cv::circle(frame, CENTER, 4, cv::Scalar(0, 255, 255), -1);
+        cv::arrowedLine(frame, CENTER, CENTER + cv::Point(0, -50), cv::Scalar(128, 128, 128), 2);
+        cv::putText(frame, "Front", CENTER + cv::Point(10, -55),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(128, 128, 128), 1);
+
+        // 결과 출력
+        cv::imshow("Simulated LIDAR", frame);
+        if (cv::waitKey(30) == 27) break;
+    }
+
+    cap.release();
+    cv::destroyAllWindows();
+    return 0;
+}
